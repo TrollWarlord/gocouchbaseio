@@ -1,9 +1,7 @@
 package gocouchbaseio
 
 import (
-	"encoding/json"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"unsafe"
 )
@@ -32,6 +30,7 @@ type Agent struct {
 	authFn     AuthFunc
 
 	routingInfo unsafe.Pointer
+	numVbuckets int
 
 	configCh     chan *cfgBucket
 	configWaitCh chan *memdRequest
@@ -47,19 +46,6 @@ type Agent struct {
 		NumOpResp        uint64
 		NumOpTimeout     uint64
 	}
-}
-
-func parseConfig(source *memdQueueConn, config []byte) (*cfgBucket, error) {
-	configStr := strings.Replace(string(config), "$HOST", source.Hostname(), -1)
-
-	bk := new(cfgBucket)
-	err := json.Unmarshal([]byte(configStr), bk)
-	if err != nil {
-		return nil, err
-	}
-
-	bk.SourceHostname = source.Hostname()
-	return bk, nil
 }
 
 func (c *Agent) globalHandler() {
@@ -82,7 +68,7 @@ func (c *Agent) globalHandler() {
 
 func (c *Agent) handleServerNmv(s *memdQueueConn, req *memdRequest, resp *memdResponse) {
 	// Try to parse the value as a bucket configuration
-	bk, err := parseConfig(s, resp.Value)
+	bk, err := parseConfig(resp.Value, s.Hostname())
 	if err == nil {
 		c.updateConfig(bk)
 	}
@@ -103,9 +89,15 @@ func (c *Agent) handleServerDeath(s *memdQueueConn) {
 func (c *Agent) updateConfig(bk *cfgBucket) {
 	atomic.AddUint64(&c.Stats.NumConfigUpdate, 1)
 
+	// Use the existing config if none was passed
 	if bk == nil {
 		oldRouting := (*routeData)(atomic.LoadPointer(&c.routingInfo))
 		bk = oldRouting.source
+	}
+
+	// Check some basic things to ensure consistency!
+	if len(bk.VBucketServerMap.VBucketMap) != c.numVbuckets {
+		panic("Received a configuration with a different number of vbuckets.")
 	}
 
 	var kvServerList []string
@@ -289,13 +281,13 @@ func (c *Agent) connect(memdAddrs, httpAddrs []string) error {
 			continue
 		}
 
-		cccpBytes, err := srv.DoCccpRequest()
+		cccpBytes, err := srv.ExecCccpRequest()
 		if err != nil {
 			srv.Close()
 			continue
 		}
 
-		bk, err := parseConfig(srv, cccpBytes)
+		bk, err := parseConfig(cccpBytes, srv.Hostname())
 		if err != nil {
 			srv.Close()
 			continue
@@ -309,6 +301,7 @@ func (c *Agent) connect(memdAddrs, httpAddrs []string) error {
 		c.routingInfo = unsafe.Pointer(&routeData{
 			servers: []*memdQueueConn{srv},
 		})
+		c.numVbuckets = len(bk.VBucketServerMap.VBucketMap)
 
 		srv.SetHandlers(c.handleServerNmv, c.handleServerDeath)
 
@@ -363,7 +356,9 @@ func (c *Agent) routeRequest(req *memdRequest) *memdQueueConn {
 
 	repId := req.ReplicaIdx
 	if repId < 0 {
-		panic("Uhh ohh...")
+		vbId := req.Vbucket
+		srvIdx := routingInfo.vbMap[vbId][0]
+		return routingInfo.servers[srvIdx]
 	} else {
 		vbId := cbCrc(req.Key) % uint32(len(routingInfo.vbMap))
 		req.Vbucket = uint16(vbId)
@@ -392,12 +387,16 @@ func (c *Agent) dispatchDirect(req *memdRequest) error {
 	return nil
 }
 
-func (c *Agent) GetCapiEps() []string {
+func (c *Agent) NumVbuckets() int {
+	return c.numVbuckets
+}
+
+func (c *Agent) CapiEps() []string {
 	routingInfo := *(*routeData)(atomic.LoadPointer(&c.routingInfo))
 	return routingInfo.capiEpList
 }
 
-func (c *Agent) GetMgmtEps() []string {
+func (c *Agent) MgmtEps() []string {
 	routingInfo := *(*routeData)(atomic.LoadPointer(&c.routingInfo))
 	return routingInfo.mgmtEpList
 }

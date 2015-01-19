@@ -1,10 +1,8 @@
 package gocouchbaseio
 
 import (
-	"crypto/tls"
 	"encoding/binary"
 	"io"
-	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,11 +19,10 @@ type Dialer interface {
 type AuthClient interface {
 	Address() string
 
-	SaslListMechs() ([]string, error)
-	SaslAuth(k, v []byte) ([]byte, error)
-	SaslStep(k, v []byte) ([]byte, error)
-	SelectBucket(b []byte) error
-	OpenDcpStream(streamName string) error
+	ExecSaslListMechs() ([]string, error)
+	ExecSaslAuth(k, v []byte) ([]byte, error)
+	ExecSaslStep(k, v []byte) ([]byte, error)
+	ExecSelectBucket(b []byte) error
 }
 
 type AuthFunc func(AuthClient) error
@@ -33,30 +30,12 @@ type AuthFunc func(AuthClient) error
 type CloseHandler func(*memdQueueConn)
 type BadRouteHandler func(*memdQueueConn, *memdRequest, *memdResponse)
 
-type memdAuthClient struct {
-	srv *memdQueueConn
-}
-
-func (s *memdAuthClient) Address() string {
-	return s.srv.address
-}
-func (s *memdAuthClient) SaslListMechs() ([]string, error) {
-	return s.srv.DoSaslListMechs()
-}
-func (s *memdAuthClient) SaslAuth(k, v []byte) ([]byte, error) {
-	return s.srv.DoSaslAuth(k, v)
-}
-func (s *memdAuthClient) SaslStep(k, v []byte) ([]byte, error) {
-	return s.srv.DoSaslStep(k, v)
-}
-func (s *memdAuthClient) SelectBucket(b []byte) error {
-	return s.srv.DoSelectBucket(b)
-}
-func (s *memdAuthClient) OpenDcpStream(streamName string) error {
-	return s.srv.DoOpenDcpStream(streamName)
-}
-
+// Callback invoked by a successfully executed request
 type Callback func(*memdResponse, error)
+
+// The data for a request that can be queued with a memdqueueconn,
+//   and can potentially be rerouted to multiple servers due to
+//   configuration changes.
 type memdRequest struct {
 	// These properties are not modified once dispatched
 	Magic      CommandMagic
@@ -88,11 +67,33 @@ type memdRequest struct {
 	queueNext *memdRequest
 }
 
+// The data returned from the server in relation to an executed
+//   request.
+type memdResponse struct {
+	Magic    CommandMagic
+	Opcode   CommandCode
+	Datatype uint8
+	Status   StatusCode
+	Cas      uint64
+	Key      []byte
+	Extras   []byte
+	Value    []byte
+
+	opaque uint32
+}
+
+// This is used to store operations while they are pending
+//   a response from the server to allow mapping of a response
+//   opaque back to the originating request.  This queue takes
+//   advantage of the monotonic nature of the opaque values
+//   and synchronous responses from the server to nearly always
+//   return the request without needing to iterate at all.
 type memdOpQueue struct {
 	first *memdRequest
 	last  *memdRequest
 }
 
+// Add a new request to the bottom of the op queue.
 func (q *memdOpQueue) Add(r *memdRequest) {
 	if q.last == nil {
 		q.first = r
@@ -103,6 +104,9 @@ func (q *memdOpQueue) Add(r *memdRequest) {
 	}
 }
 
+// Removes a request from the op queue.  Expects to be passed
+//   the request to remove, along with the request that
+//   immediately preceeds it in the queue.
 func (q *memdOpQueue) remove(prev *memdRequest, req *memdRequest) {
 	if prev == nil {
 		q.first = req.queueNext
@@ -117,6 +121,7 @@ func (q *memdOpQueue) remove(prev *memdRequest, req *memdRequest) {
 	}
 }
 
+// Removes a specific request from the op queue.
 func (q *memdOpQueue) Remove(req *memdRequest) bool {
 	var cur *memdRequest = q.first
 	var prev *memdRequest
@@ -131,6 +136,9 @@ func (q *memdOpQueue) Remove(req *memdRequest) bool {
 	return false
 }
 
+// Locates a request (searching FIFO-style) in the op queue using
+//   the opaque value that was assigned to it when it was dispatched.
+//   It then removes the request from the queue if it is not persistent.
 func (q *memdOpQueue) FindAndMaybeRemove(opaque uint32) *memdRequest {
 	var cur *memdRequest = q.first
 	var prev *memdRequest
@@ -147,25 +155,14 @@ func (q *memdOpQueue) FindAndMaybeRemove(opaque uint32) *memdRequest {
 	return nil
 }
 
+// Clears the queue of all requests and calls the passed function
+//   once for each request found in the queue.
 func (q *memdOpQueue) Drain(cb func(*memdRequest)) {
 	for cur := q.first; cur != nil; cur = cur.queueNext {
 		cb(cur)
 	}
 	q.first = nil
 	q.last = nil
-}
-
-type memdResponse struct {
-	Magic    CommandMagic
-	Opcode   CommandCode
-	Datatype uint8
-	Status   StatusCode
-	Cas      uint64
-	Key      []byte
-	Extras   []byte
-	Value    []byte
-
-	opaque uint32
 }
 
 type memdQueueConn struct {
@@ -187,7 +184,6 @@ type memdQueueConn struct {
 	mapLock sync.Mutex
 	opIndex uint32
 	opList  memdOpQueue
-	//opMap   map[uint32]*memdRequest
 
 	ioDoneCh chan bool
 }
@@ -225,7 +221,7 @@ func (s *memdQueueConn) Connect(authFn AuthFunc) error {
 	s.conn = conn
 	go s.runIoHandlers()
 
-	err = authFn(&memdAuthClient{s})
+	err = authFn(s)
 	if err != nil {
 		// We errored, close the connection!
 		s.conn.Close()
@@ -374,7 +370,10 @@ func (s *memdQueueConn) DispatchRequest(req *memdRequest) bool {
 		return false
 	}
 
-	atomic.StorePointer(&req.queuedWith, unsafe.Pointer(s))
+	oldSP := atomic.SwapPointer(&req.queuedWith, unsafe.Pointer(s))
+	if oldSP != nil {
+		panic("Request was dispatched while already queued somewhere.")
+	}
 
 	s.reqsCh <- req
 	s.lock.RUnlock()
@@ -577,7 +576,7 @@ func (s *memdQueueConn) CloseAndDrain(reqCb drainedReqCallback) {
 	signal <- true
 }
 
-func (s *memdQueueConn) DoCccpRequest() ([]byte, error) {
+func (s *memdQueueConn) ExecCccpRequest() ([]byte, error) {
 	resp, err := s.ExecRequest(&memdRequest{
 		Magic:    ReqMagic,
 		Opcode:   CmdGetClusterConfig,
@@ -606,20 +605,20 @@ func (s *memdQueueConn) doBasicOp(cmd CommandCode, k, v []byte) ([]byte, error) 
 	}
 	return resp.Value, nil
 }
-func (s *memdQueueConn) DoSaslListMechs() ([]string, error) {
+func (s *memdQueueConn) ExecSaslListMechs() ([]string, error) {
 	bytes, err := s.doBasicOp(CmdSASLListMechs, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	return strings.Split(string(bytes), " "), nil
 }
-func (s *memdQueueConn) DoSaslAuth(k, v []byte) ([]byte, error) {
+func (s *memdQueueConn) ExecSaslAuth(k, v []byte) ([]byte, error) {
 	return s.doBasicOp(CmdSASLAuth, k, v)
 }
-func (s *memdQueueConn) DoSaslStep(k, v []byte) ([]byte, error) {
+func (s *memdQueueConn) ExecSaslStep(k, v []byte) ([]byte, error) {
 	return s.doBasicOp(CmdSASLStep, k, v)
 }
-func (s *memdQueueConn) DoSelectBucket(b []byte) error {
+func (s *memdQueueConn) ExecSelectBucket(b []byte) error {
 	_, err := s.doBasicOp(CmdSelectBucket, nil, b)
 	return err
 }

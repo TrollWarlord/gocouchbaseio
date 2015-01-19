@@ -284,7 +284,7 @@ func (c *Agent) Decrement(key []byte, delta, initial uint64, expiry uint32, cb C
 
 type DcpStreamReqCallback func(error)
 
-func (c *Agent) DcpStreamReq(vbId int, startSeqNo, endSeqNo, vbUuid uint64, cb DcpStreamReqCallback) (PendingOp, error) {
+func (c *Agent) DcpStreamReq(vbId uint16, vbUuid, startSeqNo, endSeqNo uint64, cb DcpStreamReqCallback) (PendingOp, error) {
 	handler := func(resp *memdResponse, err error) {
 		cb(err)
 	}
@@ -308,7 +308,8 @@ func (c *Agent) DcpStreamReq(vbId int, startSeqNo, endSeqNo, vbUuid uint64, cb D
 		Value:      nil,
 		Callback:   handler,
 		ReplicaIdx: -1,
-		Vbucket:    uint16(cbCrc([]byte("testkey")) % 1024),
+		Vbucket:    vbId,
+		Persistent: true,
 	}
 	return c.dispatchOp(req)
 }
