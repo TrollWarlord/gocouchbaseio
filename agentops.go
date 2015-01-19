@@ -2,6 +2,7 @@ package gocouchbaseio
 
 import (
 	"encoding/binary"
+	"fmt"
 	"strconv"
 )
 
@@ -286,6 +287,7 @@ type DcpStreamReqCallback func(error)
 
 func (c *Agent) DcpStreamReq(vbId uint16, vbUuid, startSeqNo, endSeqNo uint64, cb DcpStreamReqCallback) (PendingOp, error) {
 	handler := func(resp *memdResponse, err error) {
+		fmt.Printf("DCP Stream Req Resp: %v %v\n", err, resp)
 		cb(err)
 	}
 

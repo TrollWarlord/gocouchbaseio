@@ -16,16 +16,7 @@ type Dialer interface {
 	Dial(address string, useSsl bool) (io.ReadWriteCloser, error)
 }
 
-type AuthClient interface {
-	Address() string
-
-	ExecSaslListMechs() ([]string, error)
-	ExecSaslAuth(k, v []byte) ([]byte, error)
-	ExecSaslStep(k, v []byte) ([]byte, error)
-	ExecSelectBucket(b []byte) error
-}
-
-type AuthFunc func(AuthClient) error
+type memdInitFunc func(*memdQueueConn) error
 
 type CloseHandler func(*memdQueueConn)
 type BadRouteHandler func(*memdQueueConn, *memdRequest, *memdResponse)
@@ -176,6 +167,7 @@ type memdQueueConn struct {
 	lock           sync.RWMutex
 	isClosed       bool
 	isDrained      bool
+	initReqsCh     chan *memdRequest
 	reqsCh         chan *memdRequest
 	handleBadRoute BadRouteHandler
 	handleDeath    CloseHandler
@@ -202,17 +194,17 @@ func (s *memdQueueConn) IsClosed() bool {
 
 func createMemdQueueConn(addr string, useSsl bool, dialer Dialer) *memdQueueConn {
 	return &memdQueueConn{
-		address: addr,
-		useSsl:  useSsl,
-		dialer:  dialer,
-		reqsCh:  make(chan *memdRequest, 100),
-		//opMap:    make(map[uint32]*memdRequest, 2000),
-		ioDoneCh: make(chan bool, 1),
+		address:    addr,
+		useSsl:     useSsl,
+		dialer:     dialer,
+		initReqsCh: make(chan *memdRequest, 10),
+		reqsCh:     make(chan *memdRequest, 100),
+		ioDoneCh:   make(chan bool, 1),
 	}
 }
 
 // Dials and Authenticates a memdQueueConn object to the cluster.
-func (s *memdQueueConn) Connect(authFn AuthFunc) error {
+func (s *memdQueueConn) Connect(initFn memdInitFunc) error {
 	conn, err := s.dialer.Dial(s.address, s.useSsl)
 	if err != nil {
 		return err
@@ -221,12 +213,14 @@ func (s *memdQueueConn) Connect(authFn AuthFunc) error {
 	s.conn = conn
 	go s.runIoHandlers()
 
-	err = authFn(s)
+	err = initFn(s)
 	if err != nil {
 		// We errored, close the connection!
 		s.conn.Close()
 		return err
 	}
+
+	close(s.initReqsCh)
 
 	return nil
 }
@@ -237,38 +231,12 @@ func (s *memdQueueConn) SetHandlers(badRouteFn BadRouteHandler, deathFn CloseHan
 		// We died between authentication and here, no deathFn was set,
 		//   so we need to notify through the return of this function.
 		s.lock.Unlock()
-		return &generalError{"Network error"}
+		return networkError{}
 	}
 	s.handleBadRoute = badRouteFn
 	s.handleDeath = deathFn
 	s.lock.Unlock()
 	return nil
-}
-
-func (s *memdQueueConn) ExecRequest(req *memdRequest) (respOut *memdResponse, errOut error) {
-	if req.Callback != nil {
-		panic("Tried to synchronously dispatch an operation with an async handler.")
-	}
-
-	signal := make(chan bool)
-
-	req.Callback = func(resp *memdResponse, err error) {
-		respOut = resp
-		errOut = err
-		signal <- true
-	}
-
-	if !s.DispatchRequest(req) {
-		return nil, &generalError{"Failed to dispatch operation."}
-	}
-
-	select {
-	case <-signal:
-		return
-	case <-time.After(2500 * time.Millisecond):
-		req.Cancel()
-		return nil, &generalError{"Operation timed out."}
-	}
 }
 
 func (s *memdQueueConn) writeRequest(req *memdRequest) error {
@@ -361,9 +329,7 @@ func (s *memdQueueConn) readResponse() (*memdResponse, error) {
 	}, nil
 }
 
-// Dispatch a request to this server instance, this operation will
-//   fail if the server you're dispatching to has been drained.
-func (s *memdQueueConn) DispatchRequest(req *memdRequest) bool {
+func (s *memdQueueConn) queueRequest(req *memdRequest, forInit bool) bool {
 	s.lock.RLock()
 	if s.isDrained {
 		s.lock.RUnlock()
@@ -375,9 +341,20 @@ func (s *memdQueueConn) DispatchRequest(req *memdRequest) bool {
 		panic("Request was dispatched while already queued somewhere.")
 	}
 
-	s.reqsCh <- req
+	if !forInit {
+		s.reqsCh <- req
+	} else {
+		s.initReqsCh <- req
+	}
+
 	s.lock.RUnlock()
 	return true
+}
+
+// Dispatch a request to this server instance, this operation will
+//   fail if the server you're dispatching to has been drained.
+func (s *memdQueueConn) QueueRequest(req *memdRequest) bool {
+	return s.queueRequest(req, false)
 }
 
 func (r *memdRequest) Cancel() bool {
@@ -392,20 +369,46 @@ func (r *memdRequest) Cancel() bool {
 	return true
 }
 
+func (s *memdQueueConn) execRequest(req *memdRequest, forInit bool) (respOut *memdResponse, errOut error) {
+	if req.Callback != nil {
+		panic("Tried to synchronously dispatch an operation with an async handler.")
+	}
+
+	signal := make(chan bool)
+
+	req.Callback = func(resp *memdResponse, err error) {
+		respOut = resp
+		errOut = err
+		signal <- true
+	}
+
+	if !s.queueRequest(req, forInit) {
+		return nil, &generalError{"Failed to dispatch operation."}
+	}
+
+	select {
+	case <-signal:
+		return
+	case <-time.After(2500 * time.Millisecond):
+		req.Cancel()
+		return nil, &generalError{"Operation timed out."}
+	}
+}
+
+func (s *memdQueueConn) execInitRequest(req *memdRequest) (respOut *memdResponse, errOut error) {
+	return s.execRequest(req, true)
+}
+
+func (s *memdQueueConn) ExecRequest(req *memdRequest) (respOut *memdResponse, errOut error) {
+	return s.execRequest(req, false)
+}
+
 func (s *memdQueueConn) resolveRequest(resp *memdResponse) {
 	opIndex := resp.opaque
 
 	// Find the request that goes with this response
 	s.mapLock.Lock()
 	req := s.opList.FindAndMaybeRemove(opIndex)
-	/*
-		req := s.opMap[opIndex]
-		if req != nil {
-			if !req.Persistent {
-				delete(s.opMap, opIndex)
-			}
-		}
-	*/
 	s.mapLock.Unlock()
 
 	if req == nil {
@@ -413,10 +416,12 @@ func (s *memdQueueConn) resolveRequest(resp *memdResponse) {
 		return
 	}
 
-	if !atomic.CompareAndSwapPointer(&req.queuedWith, unsafe.Pointer(s), nil) {
-		// While we found a valid request, the request does not appear to be queued
-		//   with this server anymore, this probably means that it has been cancelled.
-		return
+	if !req.Persistent {
+		if !atomic.CompareAndSwapPointer(&req.queuedWith, unsafe.Pointer(s), nil) {
+			// While we found a valid request, the request does not appear to be queued
+			//   with this server anymore, this probably means that it has been cancelled.
+			return
+		}
 	}
 
 	if resp.Status == StatusNotMyVBucket {
@@ -433,12 +438,41 @@ func (s *memdQueueConn) resolveRequest(resp *memdResponse) {
 		}
 	}
 
-	// Call the requests callback handler...
-	if resp.Status == StatusSuccess {
+	// Call the requests callback handler...  Ignore Status field for incoming requests.
+	if resp.Magic == ReqMagic || resp.Status == StatusSuccess {
 		req.Callback(resp, nil)
 	} else {
 		req.Callback(nil, &memdError{resp.Status})
 	}
+}
+
+func (s *memdQueueConn) dispatchRequest(req *memdRequest) error {
+	// We do a cursory check of the server to avoid dispatching operations on the network
+	//   that have already knowingly been cancelled.  This doesn't guarentee a cancelled
+	//   operation from being sent, but it does reduce network IO when possible.
+	server := (*memdQueueConn)(atomic.LoadPointer(&req.queuedWith))
+	if server != s {
+		// Even though we failed to dispatch, this is not actually an error,
+		//   we just consume the operation since its already been handled elsewhere
+		return nil
+	}
+
+	s.mapLock.Lock()
+	s.opIndex++
+	req.opaque = s.opIndex
+	s.opList.Add(req)
+	s.mapLock.Unlock()
+
+	err := s.writeRequest(req)
+	if err != nil {
+		s.mapLock.Lock()
+		s.opList.Remove(req)
+		s.mapLock.Unlock()
+
+		return err
+	}
+
+	return nil
 }
 
 func (s *memdQueueConn) runIoHandlers() {
@@ -458,41 +492,50 @@ func (s *memdQueueConn) runIoHandlers() {
 	}()
 
 	// Writing
-WriterLoop:
+InitWriterLoop:
 	for {
 		select {
-		case req := <-s.reqsCh:
-			// We do a cursory check of the server to avoid dispatching operations on the network
-			//   that have already knowingly been cancelled.  This doesn't guarentee a cancelled
-			//   operation from being sent, but it does reduce network IO when possible.
-			server := (*memdQueueConn)(atomic.LoadPointer(&req.queuedWith))
-			if server != s {
-				continue
-			}
+		case req, ok := <-s.initReqsCh:
+			if ok {
+				err := s.dispatchRequest(req)
+				if err != nil {
+					// We can assume that the server is not fully drained yet, as the drainer blocks
+					//   waiting for the IO goroutines to finish first.
+					s.initReqsCh <- req
 
-			s.mapLock.Lock()
-			s.opIndex++
-			req.opaque = s.opIndex
-			s.opList.Add(req)
-			s.mapLock.Unlock()
+					// We must wait for the receive goroutine to die as well before we can continue.
+					<-killSig
 
-			err := s.writeRequest(req)
-			if err != nil {
-				s.mapLock.Lock()
-				s.opList.Remove(req)
-				s.mapLock.Unlock()
+					break InitWriterLoop
+				}
+			} else {
+				// The initReqsCh was closed, which means we are done initializing
+				// We set the init channel to nil now that we have been signalled that
+				//   its no longer in use to ensure nobody else tries to read from it!
+				s.initReqsCh = nil
+			WriterLoop:
+				for {
+					select {
+					case req := <-s.reqsCh:
+						err := s.dispatchRequest(req)
+						if err != nil {
+							// We can assume that the server is not fully drained yet, as the drainer blocks
+							//   waiting for the IO goroutines to finish first.
+							s.reqsCh <- req
 
-				// We can assume that the server is not fully drained yet, as the drainer blocks
-				//   waiting for the IO goroutines to finish first.
-				s.reqsCh <- req
+							// We must wait for the receive goroutine to die as well before we can continue.
+							<-killSig
 
-				// We must wait for the receive goroutine to die as well before we can continue.
-				<-killSig
-
-				break WriterLoop
+							break WriterLoop
+						}
+					case <-killSig:
+						break WriterLoop
+					}
+				}
+				break InitWriterLoop
 			}
 		case <-killSig:
-			break WriterLoop
+			break InitWriterLoop
 		}
 	}
 
@@ -508,7 +551,7 @@ WriterLoop:
 		deathFn(s)
 	} else {
 		s.CloseAndDrain(func(r *memdRequest) {
-			r.Callback(nil, &generalError{"Network Error"})
+			r.Callback(nil, networkError{})
 		})
 	}
 }
@@ -530,6 +573,8 @@ func (s *memdQueueConn) CloseAndDrain(reqCb drainedReqCallback) {
 		//   are trying to send to the queue which could be full.
 		for {
 			select {
+			case req := <-s.initReqsCh:
+				req.Callback(nil, networkError{})
 			case req := <-s.reqsCh:
 				reqCb(req)
 			case <-signal:
@@ -537,6 +582,8 @@ func (s *memdQueueConn) CloseAndDrain(reqCb drainedReqCallback) {
 				//  need to drain what was there.
 				for {
 					select {
+					case req := <-s.initReqsCh:
+						req.Callback(nil, networkError{})
 					case req := <-s.reqsCh:
 						reqCb(req)
 					default:
@@ -569,7 +616,7 @@ func (s *memdQueueConn) CloseAndDrain(reqCb drainedReqCallback) {
 	//   since the IO goroutine is stopped, and isDrained is set so no more
 	//   requests will be dispatched.
 	s.opList.Drain(func(r *memdRequest) {
-		r.Callback(nil, &generalError{"Network Error"})
+		r.Callback(nil, networkError{})
 	})
 
 	// Signal our drain coroutine that it can stop now.
@@ -593,8 +640,8 @@ func (s *memdQueueConn) ExecCccpRequest() ([]byte, error) {
 	return resp.Value, nil
 }
 
-func (s *memdQueueConn) doBasicOp(cmd CommandCode, k, v []byte) ([]byte, error) {
-	resp, err := s.ExecRequest(&memdRequest{
+func (s *memdQueueConn) doBasicInitOp(cmd CommandCode, k, v []byte) ([]byte, error) {
+	resp, err := s.execInitRequest(&memdRequest{
 		Magic:  ReqMagic,
 		Opcode: cmd,
 		Key:    k,
@@ -606,29 +653,29 @@ func (s *memdQueueConn) doBasicOp(cmd CommandCode, k, v []byte) ([]byte, error) 
 	return resp.Value, nil
 }
 func (s *memdQueueConn) ExecSaslListMechs() ([]string, error) {
-	bytes, err := s.doBasicOp(CmdSASLListMechs, nil, nil)
+	bytes, err := s.doBasicInitOp(CmdSASLListMechs, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	return strings.Split(string(bytes), " "), nil
 }
 func (s *memdQueueConn) ExecSaslAuth(k, v []byte) ([]byte, error) {
-	return s.doBasicOp(CmdSASLAuth, k, v)
+	return s.doBasicInitOp(CmdSASLAuth, k, v)
 }
 func (s *memdQueueConn) ExecSaslStep(k, v []byte) ([]byte, error) {
-	return s.doBasicOp(CmdSASLStep, k, v)
+	return s.doBasicInitOp(CmdSASLStep, k, v)
 }
 func (s *memdQueueConn) ExecSelectBucket(b []byte) error {
-	_, err := s.doBasicOp(CmdSelectBucket, nil, b)
+	_, err := s.doBasicInitOp(CmdSelectBucket, nil, b)
 	return err
 }
 
-func (s *memdQueueConn) DoOpenDcpStream(streamName string) error {
+func (s *memdQueueConn) OpenDcpChannel(streamName string) error {
 	extraBuf := make([]byte, 8)
 	binary.BigEndian.PutUint32(extraBuf[0:], 0)
 	binary.BigEndian.PutUint32(extraBuf[4:], 1)
 
-	_, err := s.ExecRequest(&memdRequest{
+	_, err := s.execInitRequest(&memdRequest{
 		Magic:    ReqMagic,
 		Opcode:   CmdDcpOpenConnection,
 		Datatype: 0,

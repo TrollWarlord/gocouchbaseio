@@ -27,7 +27,7 @@ type PendingOp interface {
 type Agent struct {
 	useSsl     bool
 	memdDialer Dialer
-	authFn     AuthFunc
+	initFn     memdInitFunc
 
 	routingInfo unsafe.Pointer
 	numVbuckets int
@@ -204,7 +204,7 @@ func (c *Agent) updateConfig(bk *cfgBucket) {
 	for _, addServer := range addServers {
 		addServer := addServer
 		go func() {
-			err := addServer.Connect(c.authFn)
+			err := addServer.Connect(c.initFn)
 			if err != nil {
 				c.handleServerDeath(addServer)
 			}
@@ -226,38 +226,43 @@ func (c *Agent) updateConfig(bk *cfgBucket) {
 	}
 }
 
-/*
+type AuthClient interface {
+	Address() string
+
+	ExecSaslListMechs() ([]string, error)
+	ExecSaslAuth(k, v []byte) ([]byte, error)
+	ExecSaslStep(k, v []byte) ([]byte, error)
+	ExecSelectBucket(b []byte) error
+}
+
+type AuthFunc func(AuthClient) error
+
 func CreateDcpAgent(memdAddrs, httpAddrs []string, useSsl bool, memdDialer Dialer, authFn AuthFunc, dcpStreamName string) (*Agent, error) {
-	if memdDialer == nil {
-		memdDialer = &DefaultDialer{}
-	}
-	dcpAuthWrap := func(c AuthClient) error {
+	// We wrap the authorization system to force DCP channel opening
+	//   as part of the "initialization" for any servers.
+	dcpInitFn := func(c *memdQueueConn) error {
 		if err := authFn(c); err != nil {
 			return err
 		}
-		return c.OpenDcpStream(dcpStreamName)
+		return c.OpenDcpChannel(dcpStreamName)
 	}
-	c := &Agent{
-		useSsl:       useSsl,
-		authFn:       dcpAuthWrap,
-		configCh:     make(chan *cfgBucket, 5),
-		configWaitCh: make(chan *memdRequest, 5),
-		deadServerCh: make(chan *memdQueueConn, 5),
-	}
-	if err := c.connect(memdAddrs, httpAddrs); err != nil {
-		return nil, err
-	}
-	return c, nil
+	return createAgent(memdAddrs, httpAddrs, useSsl, memdDialer, dcpInitFn)
 }
-*/
 
 func CreateAgent(memdAddrs, httpAddrs []string, useSsl bool, memdDialer Dialer, authFn AuthFunc) (*Agent, error) {
+	initFn := func(s *memdQueueConn) error {
+		return authFn(s)
+	}
+	return createAgent(memdAddrs, httpAddrs, useSsl, memdDialer, initFn)
+}
+
+func createAgent(memdAddrs, httpAddrs []string, useSsl bool, memdDialer Dialer, initFn memdInitFunc) (*Agent, error) {
 	if memdDialer == nil {
 		memdDialer = &DefaultDialer{}
 	}
 	c := &Agent{
 		useSsl:       useSsl,
-		authFn:       authFn,
+		initFn:       initFn,
 		memdDialer:   memdDialer,
 		configCh:     make(chan *cfgBucket, 5),
 		configWaitCh: make(chan *memdRequest, 5),
@@ -276,7 +281,7 @@ func (c *Agent) connect(memdAddrs, httpAddrs []string) error {
 
 		atomic.AddUint64(&c.Stats.NumServerConnect, 1)
 
-		err := srv.Connect(c.authFn)
+		err := srv.Connect(c.initFn)
 		if err != nil {
 			continue
 		}
@@ -328,6 +333,13 @@ func (c *Agent) connect(memdAddrs, httpAddrs []string) error {
 	return nil
 }
 
+func (c *Agent) CloseTest() {
+	routingInfo := *(*routeData)(atomic.LoadPointer(&c.routingInfo))
+	for _, s := range routingInfo.servers {
+		s.Close()
+	}
+}
+
 // Drains all the requests out of the queue for this server.  This must be
 //   invoked only once this server no longer exists in the routing data or an
 //   infinite loop will likely occur.
@@ -347,7 +359,7 @@ func (c *Agent) redispatchDirect(req *memdRequest) {
 	} else {
 		// Callback advising that a network failure caused this operation to
 		//   not be processed, nothing outside the agent should really see this.
-		req.Callback(nil, agentError{"Network failure"})
+		req.Callback(nil, networkError{})
 	}
 }
 
@@ -378,13 +390,17 @@ func (c *Agent) dispatchDirect(req *memdRequest) error {
 	for {
 		server := c.routeRequest(req)
 
-		if !server.DispatchRequest(req) {
+		if !server.QueueRequest(req) {
 			continue
 		}
 
 		break
 	}
 	return nil
+}
+
+func (c *Agent) KeyToVbucket(key []byte) uint16 {
+	return uint16(cbCrc(key) % uint32(c.NumVbuckets()))
 }
 
 func (c *Agent) NumVbuckets() int {
