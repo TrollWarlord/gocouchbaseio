@@ -428,9 +428,6 @@ func (c *Agent) httpLooper(firstCfgFn func(*cfgBucket, error)) {
 func (c *Agent) connect(memdAddrs, httpAddrs []string) error {
 	var firstConfig *cfgBucket
 	for _, thisHostPort := range memdAddrs {
-		//DBG: Disable CCCP
-		continue
-
 		srv := createMemdQueueConn(thisHostPort, c.useSsl, c.memdDialer)
 
 		atomic.AddUint64(&c.Stats.NumServerConnect, 1)
